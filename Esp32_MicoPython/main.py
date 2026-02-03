@@ -70,9 +70,10 @@ def step_motor_X(steps, direction=1, delay=1):
                    
 def MotorThread(name):
     #try:
-        #半步模式下512步每圈
-        #y轴滑台旋转一圈约为 120 mm
+        #y轴滑台旋转一圈行程约为 120 mm
         #stepDis = (512.0/12.0)#约走1mm
+        
+        #半步模式下512步每圈
         #512/360 = 每度要走的不仅
     while(True):
         for i in range(360):
