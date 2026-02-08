@@ -5,15 +5,19 @@ import threading
 import time
 import queue
 import subprocess
+import struct
 from periphery import GPIO
 
 #sys.stdout.flush()
 
 # 配置
-HOST = "0.0.0.0"
-PORT = 9000
+HOST_Server = "0.0.0.0"
+PORT_Server = 9000
 
-PHOTO_QUEUE_SIZE = 20
+HOST_Client = "127.32.0.100"
+PORT_Client = 9001
+
+PHOTO_QUEUE_SIZE = 30
 STEP_DELAY = 0.005
 ROTATE_STEPS = 1
 
@@ -99,25 +103,19 @@ def socket_server():
         conn = None
 
         try:
-            # =========================
             # 创建监听
-            # =========================
             srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            srv.bind((HOST, PORT))
+            srv.bind((HOST_Server, PORT_Server))
             srv.listen(1)
 
             print("[PythonCameraServer] Server Listen....", flush=True)
 
-            # =========================
             # 等待客户端
-            # =========================
             conn, addr = srv.accept()
             print("[PythonCameraServer] Connected from", addr, flush=True)
 
-            # =========================
             # 接收循环
-            # =========================
             while not exit_flag:
 
                 data = conn.recv(1024)
@@ -188,36 +186,69 @@ def photo_producer():
         print(f"[PythonCameraServer] SnapPhoto: {photo_name}", flush=True)
         # 队列满会阻塞 → 自动暂停拍照
         photo_queue.put(photo_name)
-
         idx += 1
         if idx > PHOTO_QUEUE_SIZE:
             idx = 1
+        time.sleep(1)
 
 # Socket 发送线程
 def socket_sender():
-    print(f"[PythonCameraServer] socketSender thread tart!", flush=True)
+    print("[PythonCameraServer] socketSender thread start!", flush=True)
 
-    while not exit_flag and running:
+    cli = None
+
+    while not exit_flag:
+
+        # 未运行时不占 CPU
+        if not running:
+            time.sleep(1)
+            continue
+
         try:
-            cli = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            cli.connect(("127.32.0.100", PORT))
-            
-            print(f"[PythonCameraServer] Send Socket Connect!", flush=True)
-            
-            while not exit_flag:
-                try:
-                    photo = photo_queue.get(timeout=1)
-                except queue.Empty:
-                    continue
+            # 尚未连接则建立连接
+            if cli is None:
+                cli = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                cli.connect((HOST_Client, PORT_Client))
+                print("[PythonCameraServer] Image socket connected", flush=True)
 
-                cli.sendall((photo + "\n").encode())
+            # 阻塞等待一张照片（文件名）
+            photo_path = photo_queue.get()
+
+            # 确保文件存在
+            if not os.path.exists(photo_path):
+                print("[PythonCameraServer] photo not found:", photo_path, flush=True)
+                time.sleep(0.5)
                 photo_queue.task_done()
-                print("[PythonCameraServer] SendDone!", flush=True)
+                continue
+            
+            # 读取 JPEG 二进制
+            with open(photo_path, "rb") as f:
+                jpeg = f.read()
 
-            cli.close()
-        except Exception:
-            pass
-        time.sleep(1)
+            # 4 字节长度头（大端）
+            header = struct.pack(">I", len(jpeg))
+
+            # 发送：长度 + JPEG
+            cli.sendall(header)
+            cli.sendall(jpeg)
+
+            photo_queue.task_done()
+            print("[PythonCameraServer] Send JPEG:", photo_path, flush=True)
+
+        except Exception as e:
+            print("[PythonCameraServer] Send error:", e, flush=True)
+
+            # 出错就重连
+            try:
+                if cli:
+                    cli.close()
+            except:
+                pass
+
+            cli = None
+            time.sleep(1)
+
+
     
 # 释放资源,重启系统
 def system_cleanup_and_reboot():
@@ -259,7 +290,7 @@ if __name__ == "__main__":
         #t4.start()
         
         while not exit_flag:
-            time.sleep(1)
+            time.sleep(5)
     finally:
         system_cleanup_and_reboot()
 
