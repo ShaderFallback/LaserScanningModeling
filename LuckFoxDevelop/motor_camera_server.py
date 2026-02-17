@@ -8,13 +8,13 @@ import subprocess
 import struct
 from periphery import GPIO
 
-#sys.stdout.flush()
+PHOTO_DIR = "/tmp"
 
 # 配置
 HOST_Server = "0.0.0.0"
 PORT_Server = 9000
 
-HOST_Client = "127.32.0.100"
+HOST_Client = "172.32.0.100"
 PORT_Client = 9001
 
 PHOTO_QUEUE_SIZE = 30
@@ -181,7 +181,7 @@ def photo_producer():
 
         rotate_forward(ROTATE_STEPS)
 
-        photo_name = f"photo_{idx}.jpg"
+        photo_name = f"{PHOTO_DIR}/photo_{idx}.jpg"
         snap_photo(photo_name)
         print(f"[PythonCameraServer] SnapPhoto: {photo_name}", flush=True)
         # 队列满会阻塞 → 自动暂停拍照
@@ -200,7 +200,7 @@ def socket_sender():
     while not exit_flag:
 
         # 未运行时不占 CPU
-        if not running:
+        if not running or paused:
             time.sleep(1)
             continue
 
@@ -246,7 +246,7 @@ def socket_sender():
                 pass
 
             cli = None
-            time.sleep(1)
+            time.sleep(5)
 
 
     
@@ -278,6 +278,7 @@ def PrintTest():
 
 # 主入口
 if __name__ == "__main__":
+
     try:
         t1 = threading.Thread(target=socket_server)
         t2 = threading.Thread(target=photo_producer)
