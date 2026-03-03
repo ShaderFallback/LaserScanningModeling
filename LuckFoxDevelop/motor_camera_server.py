@@ -181,11 +181,11 @@ def photo_producer():
 
         rotate_forward(ROTATE_STEPS)
 
-        photo_name = f"{PHOTO_DIR}/photo_{idx}.jpg"
+        photo_name = f"photo_{idx}.jpg"
         snap_photo(photo_name)
         print(f"[PythonCameraServer] SnapPhoto: {photo_name}", flush=True)
         # 队列满会阻塞 → 自动暂停拍照
-        photo_queue.put(photo_name)
+        photo_queue.put(f"{PHOTO_DIR}/{photo_name}")
         idx += 1
         if idx > PHOTO_QUEUE_SIZE:
             idx = 1
