@@ -1,449 +1,714 @@
+bl_info = {
+    "name": "Laser Scanner",
+    "author": "Your Name",
+    "description": "Receive images from rotating platform and display them as texture in Blender",
+    "blender": (3, 0, 0),
+    "version": (1, 4, 0),
+    "category": "3D View",
+}
+
 import bpy
-import threading
-import time
-import serial
 import socket
 import threading
-import math
 import time
-import bmesh
+import struct
+import numpy as np
+import os
+import tempfile
+import sys
 
-bl_info = {
-    "name": "LaserScanningTool",
-    "author": "ShaderFallback",
-    "description": "",
-    "blender": (2, 80, 0),
-    "version": (0, 0, 1),
-    "location": "",
-    "warning": "",
-    "category": "Generic"
-}
-host = '127.0.0.1' #远程地址
-port = 5555     #端口号
-port_com = "COM5"  #串口号
-baud_rate = 115200  #波特率
-maxVertexCount = 0 #估计顶点数量
-maximumStroke = 4.5 #Y轴滑轨位移最大距离
-scanFrequency = 120 #扫描频率 次/秒
-displayUpdateInterval = 128 #视图顶点更新间隔
-elapsedSeconds = 0  #已用时间
-rotationSpeed = 100.0 #Y轴旋转速度
-stepY = 0.05    #Y轴位移步进
-vertexTotal = 0   #顶点数总计
-progress = 0.0 #处理进度
-is_scanning = False #是否正在扫描
-is_connected = False #是否连接
-serObject = None  #串口对象
-data_thread = None  #用于接收串口数据的线程
-scan_thread = None
-displaInfoStr = ""  #Socket接收的原始信息
-dataBuffer = []  #用于缓存接收到的数据,防止丢失数据（栈结构）
-server_socket = None  #socket服务端对象
-client_socket = None  #socket客户端对象
+# 确保用户站点包路径在sys.path中（解决Blender早期加载问题）
+user_site = os.path.join(os.path.expanduser('~'), 'AppData', 'Roaming', 'Python', 'Python311', 'site-packages')
+if user_site not in sys.path:
+    sys.path.insert(0, user_site)
 
-def time_display(elapsedSeconds):
-    total_seconds_int = int(elapsedSeconds)
+from PIL import Image
 
-    # 2. 计算小时 (Hours)
-    hours = total_seconds_int // 3600
+# ================= 全局变量 =================
+recv_running = False
+scan_running = False
+exit_flag = False
 
-    # 3. 计算剩余分钟 (Minutes)
-    # 总秒数对 3600 取余，得到不满一小时的秒数；再除以 60 得到分钟数
-    minutes = (total_seconds_int % 3600) // 60
+# 磁盘缓存
+cache_dir = None
+frame_counter = 0              # 接收帧计数器
+process_counter = 0            # 处理帧计数器
 
-    # 4. 计算剩余秒数 (Seconds)
-    # 总秒数对 60 取模，得到不满一分钟的秒数
-    seconds = total_seconds_int % 60
+# 统计信息
+received_count = 0             # 接收到的帧数
+processed_count = 0            # 已处理的帧数
 
-    # 5. 格式化输出 (HH:MM:SS)
-    time_format = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-    return time_format
-def init_socket():
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.bind((host, port))
-    server_socket.listen()
-    print(f"Server is listening on {host}:{port}")
+# 参数
+distance_max = 1000.0          # 最大量程（毫米）
+update_interval = 0.1          # 图片更新间隔（秒）
+max_frames = 0                 # 最大接收帧数（0=无限制）
+auto_cleanup = True            # 自动清理缓存
+
+# 网络配置
+board_ip = "172.32.0.93"
+control_port = 9000
+data_port = 9001
+control_sock = None
+ctrl_connected = False
+data_connected = False
+
+# 目标贴图
+target_image = None
+
+# ================= 辅助函数 =================
+def init_cache_directory():
+    """初始化缓存目录"""
+    global cache_dir
+    if cache_dir is None:
+        # 在临时目录中创建缓存文件夹
+        cache_dir = os.path.join(tempfile.gettempdir(), "blender_laser_scan_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        print(f"[Cache] Cache directory: {cache_dir}")
+
+def save_jpeg_to_disk(jpeg_bytes):
+    """将JPEG数据保存到磁盘，返回文件路径"""
+    global frame_counter
+    init_cache_directory()
     
-def remap(value, from_min, from_max, to_min, to_max):
-    from_span = from_max - from_min
-    to_span = to_max - to_min
-    value_scaled = float(value - from_min) / float(from_span)
-    return to_min + (value_scaled * to_span)
-
-def update_ui():
-    # 强制UI更新
-    for window in bpy.context.window_manager.windows:
-        for area in window.screen.areas:
-            if area.type == 'VIEW_3D':
-                area.tag_redraw()
-    if is_scanning:
-        return 0.1  # 每0.1秒调用一次
-    else:
-        return None  # 停止定时器
+    frame_counter += 1
+    filename = f"frame_{frame_counter:06d}.jpg"
+    filepath = os.path.join(cache_dir, filename)
     
-_commandSentinel = object()
-def send_command(command,speed=_commandSentinel,step=_commandSentinel):
-    global is_connected
-    if not is_connected:
+    try:
+        with open(filepath, 'wb') as f:
+            f.write(jpeg_bytes)
+        return filepath
+    except Exception as e:
+        print(f"[Cache] Error saving frame: {e}")
+        return None
+
+def cleanup_cache_file(filepath):
+    """清理单个缓存文件"""
+    try:
+        if filepath and os.path.exists(filepath):
+            os.remove(filepath)
+    except Exception as e:
+        print(f"[Cache] Error: {e}")
+
+def cleanup_all_cache():
+    """清理所有缓存文件"""
+    global cache_dir
+    if cache_dir and os.path.exists(cache_dir):
+        try:
+            for filename in os.listdir(cache_dir):
+                filepath = os.path.join(cache_dir, filename)
+                if os.path.isfile(filepath):
+                    os.remove(filepath)
+            print(f"[Cache] Cleaned")
+        except Exception as e:
+            print(f"[Cache] Error: {e}")
+
+def get_or_create_target_image(context, props):
+    """获取用户指定的 Image，如果为空则创建默认图像"""
+    img = props.target_image
+    if img and img.size[0] > 0:
+        return img
+    # 创建默认贴图：使用配置的分辨率，RGB格式
+    name = "LaserScanMap"
+    if name in bpy.data.images:
+        img = bpy.data.images[name]
+        props.target_image = img
+        return img
+    
+    # 使用配置的尺寸
+    width = props.texture_width
+    height = props.texture_height
+    
+    img = bpy.data.images.new(
+        name=name,
+        width=width,
+        height=height,
+        alpha=False,
+        float_buffer=False  # 使用8位颜色，与原图一致
+    )
+    img.colorspace_settings.name = 'sRGB'
+    img.pixels[:] = [0.0] * (width * height * 4)  # RGBA，全黑
+    img.update()
+    props.target_image = img
+    return img
+
+def update_texture_in_thread():
+    """在独立线程中按频率读取并更新纹理"""
+    global scan_running, exit_flag, process_counter, processed_count
+    
+    last_update_time = 0.0
+    print("[Texture Thread] Started")
+    
+    while not exit_flag:
+        if not scan_running:
+            time.sleep(0.05)
+            continue
+        
+        current_time = time.time()
+        
+        # 检查更新间隔
+        if current_time - last_update_time < update_interval:
+            time.sleep(0.01)
+            continue
+        
+        # 查找下一个未处理的文件
+        init_cache_directory()
+        if cache_dir and os.path.exists(cache_dir):
+            files = sorted([f for f in os.listdir(cache_dir) if f.endswith('.jpg')])
+            
+            if files:
+                next_file = None
+                for f in files:
+                    try:
+                        frame_num = int(f.replace('frame_', '').replace('.jpg', ''))
+                        if frame_num > process_counter:
+                            next_file = f
+                            break
+                    except:
+                        continue
+                
+                if next_file:
+                    filepath = os.path.join(cache_dir, next_file)
+                    
+                    # 直接从磁盘文件更新纹理
+                    _do_update_texture(filepath)
+                    processed_count += 1
+                    process_counter += 1
+                    
+                    # 清理已处理的文件
+                    if auto_cleanup:
+                        cleanup_cache_file(filepath)
+                    
+                    last_update_time = time.time()
+        
+        time.sleep(0.01)
+
+def _do_update_texture(filepath):
+    """直接从磁盘文件更新纹理（后台线程）"""
+    global target_image
+    
+    # 优先使用UI中的最新图像引用
+    try:
+        props = bpy.context.scene.laser_scanner_props
+        img = props.target_image
+    except:
+        img = target_image
+    
+    if img is None or not os.path.exists(filepath):
+        print(f"[Texture] Warning: No target image or file not found: {filepath}")
         return
     
-    commandStr = f"{command};{speed};{step}"
+    # 检查图像尺寸有效性
+    if img.size[0] <= 0 or img.size[1] <= 0:
+        print(f"[Texture] Error: Invalid image size {img.size}")
+        return
     
-    if speed is _commandSentinel:
-        commandStr = f"{command}"
-    if step is _commandSentinel:
-        commandStr = f"{command}"
+    try:
+        # 使用PIL从文件加载
+        pil_img = Image.open(filepath)
         
-    
-    commandEncoding = commandStr.encode() + b"\n"
-    if serObject and serObject.is_open:
-        serObject.write(commandEncoding)
-    elif client_socket:
-        client_socket.sendall(commandEncoding)
-
-def scan_task():
-    global progress, is_scanning, dataBuffer, vertexTotal
-    global stepY, rotationSpeed, elapsedSeconds, displayUpdateInterval
-    global scanFrequency, maxVertexCount
-    
-    startTime = time.time()
-    vertexTotal = 0
-    
-    send_command("start",rotationSpeed,stepY)    
-    
-    try:       
-        #创建 mesh
-        mesh = bpy.data.meshes.new("ScanPoints")
-        obj = bpy.data.objects.new("ScanPoints", mesh)
-        obj.rotation_euler[0] = math.radians(90)
-        bpy.context.collection.objects.link(obj)
-
-        #verts = []
-        bm = bmesh.new()
+        # 获取目标尺寸
+        target_w, target_h = img.size[0], img.size[1]
+        w, h = pil_img.size
         
-        #估算总数据点大小
-        #按 60 FPS/秒 
-        #y轴位移假设移动距离 0-4 每次步进 0.1 及 4/0.1 = 40
-        #Speed 是旋转的速度，单位是 度/秒。
-        # 360/100 = 3.6 秒/圈
-        # 3.6*60 = 216点,每圈216点
-        # 总计 216 * 40 =8640点
-        total = int((360/rotationSpeed) * (maximumStroke/stepY) * scanFrequency)
-        maxVertexCount = total
-        countVer = 0
-        # 从栈顶依次取出数据直到空
-        for i in range(total):
-            if is_scanning == False:
-                progress = 0.0
-                break
-            if not dataBuffer:
-                time.sleep(0.01)
-                continue
-            
-            try:
-                line = dataBuffer.pop(0)
-            except IndexError:
-                continue
-            
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                distance, rotation, positionY = map(float, line.split(';'))
-            except ValueError:
-                print(f"跳过格式错误行: {line}")
-                continue
-            
-            #处理射线没有命中情况
-            if distance <=0: 
-                pass
-            else:
-            #正常数据需要减去标定激光0点距离
-                distance -= 8.2
-                # 坐标转换
-                x = distance * math.cos(math.radians(rotation))
-                z = distance * math.sin(math.radians(rotation))
-                y = positionY
-                #verts.append((x, y, z))
-                bm.verts.new((x, y, z))
-                vertexTotal += 1
-                
-            # 更新进度
-            progress = remap(i, 0, total, 0, 100) 
-            
-            elapsedSeconds = time.time() - startTime
-            
-            #每64个点重建一次Mesh,方便预览,(不能频繁重建会宕机)
-            countVer += 1
-            if countVer >= displayUpdateInterval:
-                bm.to_mesh(mesh)
-                mesh.update()
-                countVer = 0
-              
-        #生成 mesh 点云   
-        #mesh.from_pydata(verts, [], [])
-        #mesh.update()
-        bm.to_mesh(mesh)
-        mesh.update()
-        bm.free()
+        # 检查源图像尺寸合理性
+        if w < 64 or h < 64:
+            print(f"[Texture] Warning: Source image too small ({w}x{h}), skipping")
+            return
+        
+        print(f"[Texture] Processing: {os.path.basename(filepath)} source={w}x{h}, target={target_w}x{target_h}")
+        
+        # 统一使用PIL进行缩放处理
+        if w != target_w or h != target_h:
+            pil_img = pil_img.resize((target_w, target_h), Image.BILINEAR)
+            print(f"[Texture] Resized from {w}x{h} to {target_w}x{target_h}")
+        
+        # 转换为RGB并归一化到[0,1]
+        rgb_array = np.array(pil_img.convert('RGB')).astype(np.float32) / 255.0
+        
+        # 转换为RGBA
+        rgba = np.zeros((target_h, target_w, 4), dtype=np.float32)
+        rgba[:, :, :3] = rgb_array
+        rgba[:, :, 3] = 1.0
+        
+        # 在后台线程中直接更新像素
+        img.pixels[:] = rgba.flatten()
+        img.update()
+        
+        # 刷新视图
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+        
+        print(f"[Texture] Updated successfully")
+        
     except Exception as e:
-        print(f"扫描任务出错: {e}")
+        import traceback
+        print(f"[Texture] Error: {e}")
+        traceback.print_exc()
 
-    is_scanning = False  
-    progress = 0.0
-    dataBuffer.clear()
-    bpy.app.timers.register(update_ui)
+def send_control_cmd(cmd):
+    """发送控制命令"""
+    global control_sock, ctrl_connected
+    if not ctrl_connected or control_sock is None:
+        return False
+    try:
+        control_sock.sendall((cmd + "\n").encode())
+        return True
+    except Exception as e:
+        print(f"[CMD] Error: {e}")
+        ctrl_connected = False
+        control_sock = None
+        return False
 
-def receive_data():
-    global serObject, is_scanning, displaInfoStr, dataBuffer
-    serObject.timeout = 1.0
-    while is_scanning and serObject.is_open:
+# ================= 网络接收线程 =================
+def net_recv_thread():
+    """接收图片并保存到磁盘"""
+    global recv_running, exit_flag, data_connected, received_count
+    
+    print(f"[Net] Starting receiver thread for {board_ip}:{data_port}")
+    
+    client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
+    while recv_running and not exit_flag:
         try:
-            data = serObject.read_until(expected=b'#')
-            data = data.decode('utf-8').strip()
-            if data:
-                print(f"Received: {data}")
-                displaInfoStr = data  
-                dataBuffer.append(data)         
-        except serial.SerialException as e:
-            print(f"Error reading from serial port: {e}")
-            is_scanning = False
-
-# 添加socket接收数据函数
-def receive_socket_data():
-    global client_socket, is_scanning, displaInfoStr, dataBuffer
-    client_socket.settimeout(1.0)
-    while is_scanning and client_socket:
-        try:
-            data = client_socket.recv(1024).decode('utf-8').strip()
-            if data:
-                print(f"Received from socket: {data}")
-                displaInfoStr = data
-                dataBuffer.append(data)
+            print(f"[Net] Connecting to {board_ip}:{data_port}...")
+            client_sock.connect((board_ip, data_port))
+            client_sock.settimeout(1.0)
+            data_connected = True
+            print(f"[Net] Connected successfully")
+            
+            buf = b""
+            while recv_running and not exit_flag:
+                # 检查是否达到最大帧数限制
+                if max_frames > 0 and received_count >= max_frames:
+                    print(f"[Net] Reached max frames ({max_frames}), stopping")
+                    recv_running = False
+                    break
+                
+                try:
+                    data = client_sock.recv(65536)
+                    if not data:
+                        print("[Net] Connection closed by server")
+                        break
+                    buf += data
+                    
+                    # 解析图片数据包
+                    while len(buf) >= 4:
+                        jpeg_len = struct.unpack(">I", buf[:4])[0]
+                        
+                        if jpeg_len > 0:
+                            if len(buf) >= 4 + jpeg_len:
+                                jpeg_bytes = buf[4:4+jpeg_len]
+                                buf = buf[4+jpeg_len:]
+                                
+                                # 保存到磁盘
+                                filepath = save_jpeg_to_disk(jpeg_bytes)
+                                if filepath:
+                                    received_count += 1
+                                    if received_count % 10 == 0:  # 每10帧打印一次
+                                        print(f"[Net] Received frame #{received_count}")
+                            else:
+                                break
+                        else:
+                            buf = buf[4:]
+                            
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    print(f"[Net] Error receiving data: {e}")
+                    break
+            
+            data_connected = False
+            client_sock.close()
+            print("[Net] Disconnected, will retry in 2 seconds...")
+            time.sleep(2)
+            
+        except socket.error as e:
+            print(f"[Net] Connection error: {e}")
+            data_connected = False
+            time.sleep(2)
         except Exception as e:
-            print(f"Error reading from socket: {e}")
-            is_scanning = False
+            print(f"[Net] Unexpected error: {e}")
+            import traceback
+            traceback.print_exc()
+            time.sleep(2)
+    
+    try:
+        client_sock.close()
+    except:
+        pass
+    print("[Net] Receiver thread stopped")
 
-class ButtonExplode(bpy.types.Operator):
-    bl_idname = "button.explode"
-    bl_label = "开始扫描"
+# ================= Blender 定时器：保持界面刷新 =================
+def status_update_timer():
+    """简单定时器，用于刷新状态显示（可选）"""
+    return 0.5
+
+def sync_params_timer():
+    """同步UI参数"""
+    global distance_max, update_interval, max_frames, auto_cleanup, target_image
+    props = bpy.context.scene.laser_scanner_props
+    distance_max = props.distance_max
+    update_interval = props.update_interval
+    max_frames = props.max_frames
+    auto_cleanup = props.auto_cleanup
+    target_image = props.target_image
+    return 1.0
+
+# ================= 操作符 =================
+# （保持之前的 SCAN_OT_connect_ctrl, disconnect_ctrl, send_cmd, start_scan, pause_scan, resume_scan, stop_scan, clear_texture 等）
+# 注意：clear_cloud 改为 clear_texture，将贴图所有像素清零
+
+class SCAN_OT_clear_texture(bpy.types.Operator):
+    bl_idname = "scan.clear_texture"
+    bl_label = "Clear Texture"
 
     def execute(self, context):
-        global is_scanning, data_thread, scan_thread, stepY, rotationSpeed
-        global scanFrequency, is_connected, maximumStroke, displayUpdateInterval
+        props = context.scene.laser_scanner_props
+        img = props.target_image
+        if img:
+            pixels = [0.0] * (img.size[0] * img.size[1] * 4)
+            img.pixels = pixels
+            img.update()
+            self.report({'INFO'}, "Texture cleared")
+        else:
+            self.report({'WARNING'}, "No target texture selected")
+        return {'FINISHED'}
+
+class SCAN_OT_create_texture(bpy.types.Operator):
+    bl_idname = "scan.create_texture"
+    bl_label = "Create/Update Texture"
+    bl_description = "Create a new texture or update existing one with configured dimensions"
+
+    def execute(self, context):
+        props = context.scene.laser_scanner_props
         
-        if not is_connected:
-            self.report({'ERROR'}, "请先连接串口,或主机")
+        # 如果已有贴图，检查尺寸是否需要更新
+        if props.target_image:
+            current_w, current_h = props.target_image.size[0], props.target_image.size[1]
+            if current_w == props.texture_width and current_h == props.texture_height:
+                self.report({'INFO'}, f"Texture already exists with correct size: {current_w}x{current_h}")
+                return {'FINISHED'}
+            else:
+                # 删除旧贴图，创建新的
+                old_img = props.target_image
+                bpy.data.images.remove(old_img)
+                props.target_image = None
+        
+        # 创建新贴图
+        img = get_or_create_target_image(context, props)
+        self.report({'INFO'}, f"Texture created: {img.size[0]}x{img.size[1]}")
+        return {'FINISHED'}
+
+# 以下是之前操作符，稍作调整（将 Clear Point Cloud 改为 Clear Texture）
+class SCAN_OT_connect_ctrl(bpy.types.Operator):
+    bl_idname = "scan.connect_ctrl"
+    bl_label = "Connect to Board"
+    
+    def execute(self, context):
+        global recv_running, exit_flag, ctrl_connected, control_sock
+        props = context.scene.laser_scanner_props
+        
+        # 关闭旧连接
+        if recv_running or ctrl_connected:
+            recv_running = False
+            exit_flag = True
+            ctrl_connected = False
+            if control_sock:
+                try:
+                    control_sock.close()
+                except:
+                    pass
+                control_sock = None
+            time.sleep(0.3)
+        
+        # 建立控制连接
+        try:
+            control_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            control_sock.settimeout(5.0)
+            control_sock.connect((props.board_ip, props.control_port))
+            ctrl_connected = True
+        except Exception as e:
+            self.report({'ERROR'}, f"Connection failed: {e}")
             return {'CANCELLED'}
         
-        if not is_scanning:
-            is_scanning = True
-            try:
-                stepY = float(context.scene.str_input_step)
-                rotationSpeed = float(context.scene.str_input_rotation_speed)
-                scanFrequency = float(context.scene.str_input_scan_frequency)
-                maximumStroke = float(context.scene.str_input_maximum_stroke)
-                displayUpdateInterval = int(context.scene.str_input_display_update_interval)
-            except ValueError:
-                self.report({'ERROR'}, "参数配置错误")
-                return {'CANCELLED'}
-            
-            self.report({'INFO'}, "开始扫描...")
-            
-            if scan_thread is None or not scan_thread.is_alive():
-                scan_thread = threading.Thread(target=scan_task)
-                scan_thread.start()
-            if serObject and serObject.is_open:
-                if data_thread is None or not data_thread.is_alive():
-                    data_thread = threading.Thread(target=receive_data)
-                    data_thread.start()
-            elif client_socket:
-                if data_thread is None or not data_thread.is_alive():
-                    data_thread = threading.Thread(target=receive_socket_data)
-                    data_thread.start()
-            bpy.app.timers.register(update_ui)
-            ButtonExplode.bl_label = "停止扫描"
-            
-        else:
-            send_command("stop")
-            is_scanning = False
-            #ButtonSerial.execute(self, context)
-            self.report({'INFO'}, "停止扫描...")
-            #停止扫描会下发命令而不是断开连接
-            # if serObject and serObject.is_open:
-            #     serObject.close()
-            ButtonExplode.bl_label = "开始扫描"
+        # 启动接收和更新线程
+        exit_flag = False
+        recv_running = True
+        threading.Thread(target=net_recv_thread, daemon=True).start()
+        threading.Thread(target=update_texture_in_thread, daemon=True).start()
+        
+        self.report({'INFO'}, f"Connected! Ctrl:{props.control_port} Data:{props.data_port}")
         return {'FINISHED'}
+
+class SCAN_OT_disconnect_ctrl(bpy.types.Operator):
+    bl_idname = "scan.disconnect_ctrl"
+    bl_label = "Disconnect"
     
-class ButtonSerial(bpy.types.Operator):
-    bl_idname = "button.serial"
-    bl_label = "连接串口"
-
     def execute(self, context):
-        global is_connected, serObject, client_socket, baud_rate, port_com, host, port
-        scene = context.scene
+        global recv_running, scan_running, exit_flag, ctrl_connected, control_sock
+        global process_counter, frame_counter
+        global received_count, processed_count
         
-        is_remote = scene.bool_isremote
-        host = scene.str_inputaddress
-        port = scene.str_inputport
-        port_com = scene.str_inputport_com
-        baud_rate = scene.str_input_baud_Rate
+        scan_running = False
+        recv_running = False
+        exit_flag = True
+        ctrl_connected = False
+        
+        if control_sock:
+            try:
+                control_sock.close()
+            except:
+                pass
+            control_sock = None
+        
+        cleanup_all_cache()
+        
+        # 重置计数器
+        process_counter = 0
+        frame_counter = 0
+        received_count = 0
+        processed_count = 0
+        
+        self.report({'INFO'}, "Disconnected")
+        return {'FINISHED'}
 
-        if not is_connected:
-            if is_remote:
-                # 远程连接模式 - 连接到本地socket服务器
-                try:                    
-                    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    client_socket.connect((host, int(port)))
-                    
-                    self.report({'INFO'}, f"已连接到服务器 {host}:{port}")
-                    is_connected = True
-                    ButtonSerial.bl_label = "断开"
-                except Exception as e:
-                    self.report({'ERROR'}, f"连接失败: {e}")
-            else:
-                # 串口连接模式
-                try:
-                    serObject = serial.Serial(port_com, int(baud_rate))
-                    self.report({'INFO'}, f"已连接到串口 {port_com}")
-                    is_connected = True
-                    ButtonSerial.bl_label = "断开"
-                except serial.SerialException as e:
-                    self.report({'ERROR'}, f"哎呀,连接串口 {port_com} 失败了: {e}")
+class SCAN_OT_send_cmd(bpy.types.Operator):
+    bl_idname = "scan.send_cmd"
+    bl_label = "Send Command"
+    command: bpy.props.StringProperty(default="start")
+    
+    def execute(self, context):
+        if send_control_cmd(self.command):
+            self.report({'INFO'}, f"Command '{self.command}' sent")
         else:
-            # 断开连接
-            if is_remote:
-                if client_socket:
-                    client_socket.close()
-                    client_socket = None
-                self.report({'INFO'}, "远程连接已断开")
-            else:
-                if serObject and serObject.is_open:
-                    serObject.close()
-                    self.report({'INFO'}, "串口已断开")
-            
-            is_connected = False
-            ButtonSerial.bl_label = "连接串口"
+            self.report({'ERROR'}, "Failed to send command")
+        return {'FINISHED'}
+
+class SCAN_OT_start_scan(bpy.types.Operator):
+    bl_idname = "scan.start_scan"
+    bl_label = "Start Scan"
+    
+    def execute(self, context):
+        global recv_running, scan_running, exit_flag
+        global received_count, processed_count, process_counter, frame_counter
+        global target_image
         
-        bpy.app.timers.register(update_ui)
+        if not ctrl_connected:
+            self.report({'ERROR'}, "Please connect first")
+            return {'CANCELLED'}
+        
+        props = context.scene.laser_scanner_props
+        
+        # 确保目标图像存在且有效
+        img = get_or_create_target_image(context, props)
+        if img is None or img.size[0] <= 0 or img.size[1] <= 0:
+            self.report({'ERROR'}, "Failed to create valid target image")
+            return {'CANCELLED'}
+        
+        # 同步全局变量
+        target_image = img
+        
+        print(f"[Scan] Starting with image: {img.name} ({img.size[0]}x{img.size[1]})")
+        
+        # 重置计数器
+        received_count = 0
+        processed_count = 0
+        process_counter = 0
+        frame_counter = 0
+        
+        # 清空缓存
+        cleanup_all_cache()
+        
+        # 启动线程
+        if not recv_running:
+            exit_flag = False
+            recv_running = True
+            threading.Thread(target=net_recv_thread, daemon=True).start()
+            threading.Thread(target=update_texture_in_thread, daemon=True).start()
+        
+        scan_running = True
+        
+        # 清空贴图
+        SCAN_OT_clear_texture.execute(self, context)
+        send_control_cmd("start")
+        
+        self.report({'INFO'}, "Scan started")
         return {'FINISHED'}
 
-class ButtonTest(bpy.types.Operator):
-    bl_idname = "button.button_test"
-    bl_label = "Test"
-
-    def execute(self, context):  
-        import threading
-        threads = threading.enumerate()
-        print("当前活动线程数:", len(threads))
-        for t in threads:
-            print("线程名:", t.name, "是否守护线程:", t.daemon)
+class SCAN_OT_stop_scan(bpy.types.Operator):
+    bl_idname = "scan.stop_scan"
+    bl_label = "Stop Scan"
+    
+    def execute(self, context):
+        global scan_running, recv_running, exit_flag, process_counter
+        
+        scan_running = False
+        recv_running = False
+        exit_flag = True
+        send_control_cmd("stop")
+        
+        process_counter = 0
+        
+        self.report({'INFO'}, "Scan stopped")
         return {'FINISHED'}
+
+class SCAN_OT_set_exposure(bpy.types.Operator):
+    bl_idname = "scan.set_exposure"
+    bl_label = "Set Exposure"
+    bl_description = "Set camera exposure time and gain"
+    
+    def execute(self, context):
+        props = context.scene.laser_scanner_props
+        
+        if not ctrl_connected:
+            self.report({'ERROR'}, "Please connect first")
+            return {'CANCELLED'}
+        
+        exp_time = int(props.exposure_time)
+        gain = int(props.exposure_gain)
+        
+        cmd = f"exp {exp_time} {gain}"
+        print(f"[Exposure] Sending command: {cmd}")
+        
+        if send_control_cmd(cmd):
+            self.report({'INFO'}, f"Exposure set: {exp_time}us, Gain: {gain}")
+        else:
+            self.report({'ERROR'}, "Failed to set exposure")
+        
+        return {'FINISHED'}
+
+# ================= UI 面板 =================
 def prop_aligned(layout, label, data, prop):
     row = layout.row(align=True)
     split = row.split(factor=0.5)
     split.label(text=label)
     split.prop(data, prop, text="")
-   
-class HelloWorldPanel(bpy.types.Panel):
-    bl_idname = "TEST_SCRIPTS"
-    bl_label = "LaserScanningTool"
+
+class SCAN_PT_panel(bpy.types.Panel):
+    bl_label = "Laser Scanner"
+    bl_idname = "SCAN_PT_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = 'LaserScanningTool'
-    
+    bl_category = "Laser Scanner"
+
     def draw(self, context):
-        global progress, is_scanning, is_connected, displaInfoStr
-        global dataBuffer, vertexTotal, elapsedSeconds, maxVertexCount, baud_rate, port_com, host, port
         layout = self.layout
-        scene = context.scene
-        
-        if is_connected:
-            layout.label(text="Socket Linking Ok")
+        props = context.scene.laser_scanner_props
+
+        # 控制连接
+        box = layout.box()
+        box.label(text="Control Connection (Dual Port)")
+        if ctrl_connected:
+            box.label(text=f"Connected to {props.board_ip}")
+            box.label(text=f"Ctrl:{props.control_port} Data:{props.data_port}")
+            row = box.row(align=True)
+            row.operator("scan.disconnect_ctrl", text="Disconnect")
+            row.operator("scan.send_cmd", text="Reboot").command = "reboot"
         else:
-            prop_aligned(layout, "Socket Link", scene, "bool_isremote")
+            prop_aligned(box, "Board IP", props, "board_ip")
+            prop_aligned(box, "Ctrl Port", props, "control_port")
+            prop_aligned(box, "Data Port", props, "data_port")
+            box.operator("scan.connect_ctrl", text="Connect")
 
-        is_remote = scene.bool_isremote
+        # 扫描控制
+        box = layout.box()
+        box.label(text="Scan Control")
+        row = box.row(align=True)
+        row.operator("scan.start_scan", text="Start Scan")
+        row.operator("scan.stop_scan", text="Stop Scan")
 
-              
-        if(is_connected):
-            if is_remote:
-                layout.label(text="Address: " + str(host))
-                layout.label(text="Port:    " + str(port))
-            else:
-                layout.label(text="Port:    "+ scene.str_inputport)
-        else:
-            if is_remote:
-                prop_aligned(layout, "Address", scene, "str_inputaddress")
-                prop_aligned(layout, "Port", scene, "str_inputport")
+        # 曝光控制
+        box = layout.box()
+        box.label(text="Exposure Control")
+        prop_aligned(box, "Exposure Time (us)", props, "exposure_time")
+        prop_aligned(box, "Gain", props, "exposure_gain")
+        box.operator("scan.set_exposure", text="Set Exposure")
 
-            else:
-                prop_aligned(layout, "COM", scene, "str_inputport_com")
-                prop_aligned(layout, "BaudRate", scene, "str_input_baud_Rate")
+        # 目标贴图
+        box = layout.box()
+        box.label(text="Target Texture")
+        prop_aligned(box, "Width", props, "texture_width")
+        prop_aligned(box, "Height", props, "texture_height")
+        prop_aligned(box, "Update Interval (s)", props, "update_interval")
+        prop_aligned(box, "Max Frames", props, "max_frames")
+        box.prop(props, "auto_cleanup", text="Auto Cleanup")
+        box.prop(props, "target_image", text="")
+        row = box.row(align=True)
+        row.operator("scan.clear_texture", text="Clear Texture")
+        row.operator("scan.create_texture", text="Create/Update Texture")
+        if props.target_image:
+            box.label(text=f"Size: {props.target_image.size[0]} x {props.target_image.size[1]}")
 
-        
-        
-        layout.operator("button.serial", text="断开" if is_connected else "连接")
-        layout.label(text="Scanning")
-                
-        prop_aligned(layout, "MaxStroke", scene, "str_input_maximum_stroke")
-        prop_aligned(layout, "Y Step", scene, "str_input_step")
-        prop_aligned(layout, "RotationSpeed", scene, "str_input_rotation_speed")
-        prop_aligned(layout, "UpdateInterval", scene, "str_input_display_update_interval")
-        prop_aligned(layout, "ScanFrequency", scene, "str_input_scan_frequency")
-        
-        
-        layout.operator("button.explode", text="停止" if is_scanning else "开始")
+        # 状态信息
+        box = layout.box()
+        box.label(text="Status")
+        box.label(text=f"Receiver: {'Running' if recv_running else 'Stopped'}")
+        box.label(text=f"Connected: {'Yes' if ctrl_connected else 'No'}")
+        box.label(text=f"Scanning: {'Active' if scan_running else 'Inactive'}")
+        box.separator()
+        box.label(text="Frame Statistics:")
+        box.label(text=f"  Received: {received_count}")
+        box.label(text=f"  Processed: {processed_count}")
+        if received_count > 0:
+            pending = received_count - processed_count
+            box.label(text=f"  Pending: {pending}")
 
-        layout.label(text=f"Progress: {progress:.1f}%")
-        value = remap(progress, 0, 99, 0, 1)
-        layout.progress(factor=value)
-        
-        layout.label(text = f"ReceivedInfo: {displaInfoStr}")
-        layout.label(text = f"BufferCount: {len(dataBuffer)}")
-        layout.label(text = f"maxVertexCount: {maxVertexCount}")
-        layout.label(text = f"VertexTotal: {vertexTotal}")
-        layout.label(text = f"Time: {time_display(elapsedSeconds)}")
-        layout.label(text = "Github ShaderFallback =^_^=")
-        layout.label(text = "LaserScanningModeling")
-        
-        #layout.operator("button.button_test", text="DebugPrint")
+# ================= 属性组 =================
+class LaserScannerProperties(bpy.types.PropertyGroup):
+    board_ip: bpy.props.StringProperty(name="Board IP", default="172.32.0.93")
+    control_port: bpy.props.IntProperty(name="Control Port", default=9000, min=1, max=65535)
+    data_port: bpy.props.IntProperty(name="Data Port", default=9001, min=1, max=65535)
+    target_image: bpy.props.PointerProperty(name="Output Texture", type=bpy.types.Image)
+    texture_width: bpy.props.IntProperty(name="Width", default=640, min=64, max=4096)
+    texture_height: bpy.props.IntProperty(name="Height", default=480, min=64, max=4096)
+    update_interval: bpy.props.FloatProperty(name="Update Interval (s)", default=0.1, min=0.01, max=2.0, precision=2)
+    max_frames: bpy.props.IntProperty(name="Max Frames (0=unlimited)", default=0, min=0, max=100000, description="Maximum frames to receive (0 = no limit)")
+    auto_cleanup: bpy.props.BoolProperty(name="Auto Cleanup", default=True, description="Automatically delete processed images from disk")
+    distance_max: bpy.props.FloatProperty(name="Max Distance (mm)", default=1000.0, min=1.0, max=5000.0)
+    exposure_time: bpy.props.IntProperty(name="Exposure Time (us)", default=10000, min=100, max=1000000, description="Camera exposure time in microseconds")
+    exposure_gain: bpy.props.IntProperty(name="Gain", default=1, min=1, max=100, description="Camera gain value")
 
+# ================= 注册与注销 =================
+classes = [
+    LaserScannerProperties,
+    SCAN_OT_connect_ctrl,
+    SCAN_OT_disconnect_ctrl,
+    SCAN_OT_send_cmd,
+    SCAN_OT_start_scan,
+    SCAN_OT_stop_scan,
+    SCAN_OT_clear_texture,
+    SCAN_OT_create_texture,
+    SCAN_OT_set_exposure,
+    SCAN_PT_panel,
+]
 
 def register():
-    bpy.utils.register_class(HelloWorldPanel)
-    bpy.utils.register_class(ButtonExplode)
-    bpy.utils.register_class(ButtonSerial)
-    bpy.utils.register_class(ButtonTest)
-    bpy.types.Scene.scan_progress = bpy.props.FloatProperty(name="ScanProgress", min=0, max=100, default=0.0)
-    bpy.types.Scene.bool_isremote = bpy.props.BoolProperty(name="RemoteConnection", default=False)
-    bpy.types.Scene.str_inputaddress = bpy.props.StringProperty(name="InputAddress", default=host)
-    bpy.types.Scene.str_inputport = bpy.props.StringProperty(name="InputPort", default=str(port))
-    bpy.types.Scene.str_inputport_com = bpy.props.StringProperty(name="COMPort", default=port_com)
-    bpy.types.Scene.str_input_step = bpy.props.StringProperty(name="OffsetStep", default="0.05")
-    bpy.types.Scene.str_input_rotation_speed = bpy.props.StringProperty(name="RotationSpeed", default="100")
-    bpy.types.Scene.str_input_display_update_interval = bpy.props.StringProperty(name="displayUpdateInterval", default="128")
-    bpy.types.Scene.str_input_scan_frequency = bpy.props.StringProperty(name="scanFrequency", default="120")
-    bpy.types.Scene.str_input_maximum_stroke = bpy.props.StringProperty(name="maximumStroke", default="4.5") 
-    bpy.types.Scene.str_input_baud_Rate = bpy.props.StringProperty(name="BaudRate", default="115200")
-    
+    for cls in classes:
+        bpy.utils.register_class(cls)
+    bpy.types.Scene.laser_scanner_props = bpy.props.PointerProperty(type=LaserScannerProperties)
+    if not bpy.app.timers.is_registered(sync_params_timer):
+        bpy.app.timers.register(sync_params_timer)
 
 def unregister():
-    bpy.utils.unregister_class(HelloWorldPanel)
-    bpy.utils.unregister_class(ButtonExplode)
-    bpy.utils.unregister_class(ButtonSerial)
-    bpy.utils.unregister_class(ButtonTest)
-    del bpy.types.Scene.scan_progress
-    del bpy.types.Scene.bool_isremote
-    del bpy.types.Scene.str_inputaddress
-    del bpy.types.Scene.str_inputport
-    del bpy.types.Scene.str_inputport_com
-    del bpy.types.Scene.str_input_step
-    del bpy.types.Scene.str_input_rotation_speed
-    del bpy.types.Scene.str_input_display_update_interval
-    del bpy.types.Scene.str_input_scan_frequency
-    del bpy.types.Scene.str_input_maximum_stroke
-    del bpy.types.Scene.str_input_baud_Rate
+    global recv_running, exit_flag, control_sock
+    recv_running = False
+    exit_flag = True
+    if control_sock:
+        try:
+            control_sock.close()
+        except:
+            pass
+    # 清理所有缓存文件
+    cleanup_all_cache()
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
+    del bpy.types.Scene.laser_scanner_props
+    if bpy.app.timers.is_registered(sync_params_timer):
+        bpy.app.timers.unregister(sync_params_timer)
 
 if __name__ == "__main__":
     register()
